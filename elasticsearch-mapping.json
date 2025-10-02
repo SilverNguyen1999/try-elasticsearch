@@ -1,0 +1,120 @@
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1,
+    "refresh_interval": "5s",
+    "analysis": {
+      "analyzer": {
+        "nft_name_analyzer": {
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "token_address": {
+        "type": "keyword"
+      },
+      "token_id": {
+        "type": "keyword"
+      },
+      "owner": {
+        "type": "keyword"
+      },
+      "base_price": {
+        "type": "double"
+      },
+      "ended_at": {
+        "type": "long"
+      },
+      "ended_price": {
+        "type": "double"
+      },
+      "expired_at": {
+        "type": "long"
+      },
+      "kind": {
+        "type": "long"
+      },
+      "maker": {
+        "type": "keyword"
+      },
+      "matcher": {
+        "type": "keyword"
+      },
+      "order_id": {
+        "type": "long"
+      },
+      "payment_token": {
+        "type": "keyword"
+      },
+      "price": {
+        "type": "double"
+      },
+      "ron_price": {
+        "type": "double"
+      },
+      "started_at": {
+        "type": "long"
+      },
+      "state": {
+        "type": "keyword"
+      },
+      "order_status": {
+        "type": "keyword"
+      },
+      "name": {
+        "type": "text",
+        "analyzer": "nft_name_analyzer",
+        "fields": {
+          "keyword": {
+            "type": "keyword"
+          }
+        }
+      },
+      "attributes": {
+        "type": "flattened",
+        "depth_limit": 20
+      },
+      "image": {
+        "type": "keyword",
+        "index": false
+      },
+      "cdn_image": {
+        "type": "keyword",
+        "index": false
+      },
+      "video": {
+        "type": "keyword",
+        "index": false
+      },
+      "animation_url": {
+        "type": "keyword",
+        "index": false
+      },
+      "description": {
+        "type": "text",
+        "index": false
+      },
+      "metadata_last_updated": {
+        "type": "long"
+      },
+      "is_shown": {
+        "type": "boolean"
+      },
+      "ownership_block_number": {
+        "type": "long"
+      },
+      "ownership_log_index": {
+        "type": "integer"
+      },
+      "raw_metadata": {
+        "type": "object",
+        "enabled": false
+      }
+    }
+  }
+}
