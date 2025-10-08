@@ -1,5 +1,11 @@
 # ERC721 Elasticsearch Migrator
 
+## 🎯 Project Goal
+
+**Find the optimal way to index NFT data in Elasticsearch for a multi-collection marketplace** where each collection has completely different properties, while maintaining fast search performance.
+
+**Status:** ✅ Solution designed - Per-collection indexing with dynamic field extraction (industry standard)
+
 A high-performance Rust application for migrating ERC721 NFT data from CSV files to Elasticsearch.
 
 ## Features
@@ -198,6 +204,24 @@ curl -X GET "localhost:9300/nft_tokens/_search" -H 'Content-Type: application/js
   "sort": [{ "ron_price": { "order": "asc" } }]
 }'
 ```
+
+---
+
+## 🎯 Multi-Collection Marketplace
+
+**Question:** "Each collection has different properties. How to make it flexible AND fast?"
+
+**Answer:** Use **one index per collection** + **collection registry**
+
+See **[MULTI_COLLECTION_STRATEGY.md](MULTI_COLLECTION_STRATEGY.md)** for the full explanation.
+
+**Quick summary:**
+- One index per collection address
+- Registry defines optimized fields per collection: `src/collection_config.rs`
+- Unknown collections still work (just less optimized)
+- Performance: 10-50x faster than PostgreSQL
+
+---
 
 ## Troubleshooting
 

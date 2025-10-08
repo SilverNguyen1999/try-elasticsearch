@@ -1,0 +1,165 @@
+{
+  "settings": {
+    "number_of_shards": 5,
+    "number_of_replicas": 1,
+    "refresh_interval": "5s",
+    "analysis": {
+      "normalizer": {
+        "lowercase_normalizer": {
+          "type": "custom",
+          "filter": ["lowercase"]
+        }
+      },
+      "analyzer": {
+        "nft_name_analyzer": {
+          "tokenizer": "standard",
+          "filter": ["lowercase", "asciifolding"]
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic_templates": [
+      {
+        "properties_longs": {
+          "path_match": "properties.*",
+          "match_mapping_type": "long",
+          "mapping": {
+            "type": "long"
+          }
+        }
+      },
+      {
+        "properties_strings": {
+          "path_match": "properties.*",
+          "match_mapping_type": "string",
+          "mapping": {
+            "type": "keyword",
+            "normalizer": "lowercase_normalizer"
+          }
+        }
+      },
+      {
+        "properties_booleans": {
+          "path_match": "properties.*",
+          "match_mapping_type": "boolean",
+          "mapping": {
+            "type": "boolean"
+          }
+        }
+      },
+      {
+        "properties_doubles": {
+          "path_match": "properties.*",
+          "match_mapping_type": "double",
+          "mapping": {
+            "type": "double"
+          }
+        }
+      }
+    ],
+    "properties": {
+      "token_address": {
+        "type": "keyword"
+      },
+      "token_id": {
+        "type": "keyword"
+      },
+      "owner": {
+        "type": "keyword"
+      },
+      "base_price": {
+        "type": "double"
+      },
+      "ended_at": {
+        "type": "long"
+      },
+      "ended_price": {
+        "type": "double"
+      },
+      "expired_at": {
+        "type": "long"
+      },
+      "kind": {
+        "type": "long"
+      },
+      "maker": {
+        "type": "keyword"
+      },
+      "matcher": {
+        "type": "keyword"
+      },
+      "order_id": {
+        "type": "long"
+      },
+      "payment_token": {
+        "type": "keyword"
+      },
+      "price": {
+        "type": "double"
+      },
+      "ron_price": {
+        "type": "double"
+      },
+      "started_at": {
+        "type": "long"
+      },
+      "state": {
+        "type": "keyword"
+      },
+      "order_status": {
+        "type": "keyword"
+      },
+      "name": {
+        "type": "text",
+        "analyzer": "nft_name_analyzer",
+        "fields": {
+          "keyword": {
+            "type": "keyword"
+          }
+        }
+      },
+      "properties": {
+        "type": "object",
+        "dynamic": true
+      },
+      "image": {
+        "type": "keyword",
+        "index": false
+      },
+      "cdn_image": {
+        "type": "keyword",
+        "index": false
+      },
+      "video": {
+        "type": "keyword",
+        "index": false
+      },
+      "animation_url": {
+        "type": "keyword",
+        "index": false
+      },
+      "description": {
+        "type": "text",
+        "index": false
+      },
+      "metadata_last_updated": {
+        "type": "long"
+      },
+      "is_shown": {
+        "type": "boolean"
+      },
+      "ownership_block_number": {
+        "type": "long"
+      },
+      "ownership_log_index": {
+        "type": "integer"
+      },
+      "raw_metadata": {
+        "type": "object",
+        "enabled": false
+      }
+    }
+  }
+}
+
