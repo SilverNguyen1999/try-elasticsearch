@@ -1,7 +1,117 @@
 # NFT Marketplace Elasticsearch Strategy
 
-**Date:** October 15, 2025  
-**Goal:** Design Elasticsearch solution for NFT trait filtering that handles all edge cases
+**Date:** October 15, 2025
+**Updated:** October 25, 2025
+**Goal:** Design Elasticsearch solution for NFT trait filtering with double-write architecture and migration strategy
+
+---
+
+## Architecture Overview
+
+### Double-Write Pattern
+- **New writes** go to both PostgreSQL and Elasticsearch simultaneously
+- **Existing data** migrated via separate migration job
+- **Benefits:**
+  - Gradual rollout without downtime
+  - Can validate ES queries against PostgreSQL
+  - Easy rollback if needed
+  - Supports both ERC721 and ERC1155
+
+### Migration Strategy
+- **Separate migration job** reads from PostgreSQL, writes to Elasticsearch
+- **Supports both ERC721 and ERC1155** token standards
+- **Checkpoint-based resumable migration** for large datasets
+- **Batch processing** for performance
+- **Can be run multiple times** (idempotent - overwrites existing documents)
+
+---
+
+## Implementation Components
+
+### 1. Double-Write Service (In Main Application)
+**Location:** `mavis-marketplace-services` (or similar)
+
+**Responsibility:**
+- When creating/updating NFT listings, write to both:
+  - PostgreSQL (existing)
+  - Elasticsearch (new)
+- Handle failures gracefully:
+  - If ES write fails, log error but don't block PostgreSQL write
+  - Implement retry logic with exponential backoff
+  - Alert on persistent ES write failures
+
+**Code Pattern:**
+```rust
+// Pseudo-code
+async fn create_listing(nft: NFT) -> Result<()> {
+    // Write to PostgreSQL
+    db.insert_listing(&nft).await?;
+
+    // Write to Elasticsearch (non-blocking)
+    match es.index_document(&nft).await {
+        Ok(_) => {},
+        Err(e) => {
+            error!("Failed to index in ES: {}", e);
+            // Log for later retry, don't fail the request
+        }
+    }
+
+    Ok(())
+}
+```
+
+### 2. Migration Job (This Repository)
+**Location:** `migrate-sample-erc721-data` (current)
+
+**Responsibility:**
+- Read existing NFT data from PostgreSQL
+- Transform to Elasticsearch document format
+- Bulk index into Elasticsearch
+- Support resumable migration with checkpoints
+- Support both ERC721 and ERC1155
+
+**Features:**
+- Checkpoint-based resumable migration
+- Batch processing (configurable batch size)
+- Parallel workers for throughput
+- Progress tracking and logging
+- Graceful shutdown with checkpoint save
+
+**Execution:**
+```bash
+# Migrate ERC721 data
+cargo run --release -- --token-type erc721
+
+# Migrate ERC1155 data
+cargo run --release -- --token-type erc1155
+
+# Resume interrupted migration
+cargo run --release -- --token-type erc721
+# Automatically resumes from last checkpoint
+```
+
+### 3. Query Service (In Main Application)
+**Location:** `mavis-marketplace-services` (or similar)
+
+**Responsibility:**
+- Provide query interface that uses Elasticsearch
+- Fall back to PostgreSQL if ES unavailable
+- Support trait filtering with range queries
+- Support full-text search on names
+
+**Query Pattern:**
+```rust
+// Pseudo-code
+async fn search_nfts(filters: SearchFilters) -> Result<Vec<NFT>> {
+    match es.search(&filters).await {
+        Ok(results) => Ok(results),
+        Err(e) => {
+            warn!("ES search failed, falling back to PostgreSQL: {}", e);
+            db.search_nfts(&filters).await
+        }
+    }
+}
+```
 
 ---
 
@@ -64,6 +174,65 @@ Result: "5" < "100" (lexicographic!) ❌
 
 ---
 
+## ERC721 vs ERC1155 Differences
+
+### ERC721 (Non-Fungible Tokens)
+- **One token per token_id**
+- **Unique ownership** - each token owned by one address
+- **Example:** Axie Infinity Units, Lands
+- **Elasticsearch:** One document per token_id
+
+**Data Structure:**
+```json
+{
+  "token_address": "0x...",
+  "token_id": "123",
+  "owner": "0x...",
+  "properties": { /* traits */ }
+}
+```
+
+### ERC1155 (Semi-Fungible Tokens)
+- **Multiple tokens per token_id** (different quantities)
+- **Shared metadata** - same token_id can have different owners
+- **Example:** Items, Potions, Consumables
+- **Elasticsearch:** One document per (token_id, owner) pair OR per token_id with quantity
+
+**Data Structure Option 1 (Per Owner):**
+```json
+{
+  "token_address": "0x...",
+  "token_id": "123",
+  "owner": "0x...",
+  "quantity": 5,
+  "properties": { /* traits */ }
+}
+```
+
+**Data Structure Option 2 (Per Token):**
+```json
+{
+  "token_address": "0x...",
+  "token_id": "123",
+  "owners": [
+    {"address": "0x...", "quantity": 5},
+    {"address": "0x...", "quantity": 3}
+  ],
+  "properties": { /* traits */ }
+}
+```
+
+**Decision:** Use Option 1 (Per Owner) for consistency with ERC721 and simpler queries.
+
+### Migration Implications
+- **ERC721:** Migrate one document per token_id
+- **ERC1155:** Migrate one document per (token_id, owner) pair
+- **Index naming:** Separate indexes or same index with `token_type` field?
+  - **Recommendation:** Same index with `token_type` field for unified search
+  - Alternative: Separate indexes if collections are completely different
+
+---
+
 ## Core Architecture
 
 ### Index Strategy
@@ -98,24 +267,30 @@ Result: "5" < "100" (lexicographic!) ❌
 
 ---
 
-## Type Handling: First Type Wins
+## Type Handling: First Type Wins, Ignore Mismatches
 
-### How Elasticsearch Dynamic Mapping Works
+### Simple Rule: First Type Wins
 
-**Key Concept:** When a field appears for the first time, ES detects its JSON type and creates the mapping accordingly.
+**Key Concept:** The first value of a trait determines its type. All subsequent values must match that type or they are ignored.
 
 **Process:**
 1. **First NFT indexed with trait "level": 1**
    - ES sees: JSON number
    - Creates: `properties.level` field with type `long`
-   
+   - **Type is now locked for this field**
+
 2. **Second NFT with "level": 5**
-   - Type matches → indexed successfully
-   
+   - Type matches (number) → indexed successfully ✅
+
 3. **Third NFT with "level": "max"**
-   - Type doesn't match (string vs long)
-   - With `ignore_malformed: true` → field value skipped, document still indexed
-   - Without it → entire document rejected (bad!)
+   - Type doesn't match (string vs long) → **value ignored** ❌
+   - Document still indexed (other fields work)
+   - This NFT's level value is skipped
+
+**That's it.** No complex logic, no type coercion, no special handling. Just:
+- First value sets the type
+- Matching values: indexed
+- Non-matching values: silently ignored
 
 ### Dynamic Templates Configuration
 
@@ -127,11 +302,12 @@ Result: "5" < "100" (lexicographic!) ❌
 - If field under `properties.*` is detected as double → map as `double` with `ignore_malformed: true`
 - If field under `properties.*` is detected as boolean → map as `boolean` with `ignore_malformed: true`
 
-**What `ignore_malformed` does:**
+**What `ignore_malformed: true` does:**
 - Allows document to be indexed even if field value doesn't match expected type
-- Silently skips the problematic field value
+- Silently skips the problematic field value (doesn't index it)
 - Other fields in document work normally
 - Prevents indexing failures
+- **This is the key setting that makes "first type wins" work**
 
 ---
 
@@ -151,21 +327,166 @@ Result: "5" < "100" (lexicographic!) ❌
      "properties": {
        "level": 1,
        "rarity": "common"
-     }
+     },
+     "attributes": [
+       {"trait_type": "level", "value": 1, "display_type": "number"},
+       {"trait_type": "rarity", "value": "common", "display_type": "string"}
+     ]
    }
    ```
 
 **Extraction Strategy:**
-- **Priority 1:** Use `raw_metadata.properties` if available (has correct types already)
-- **Priority 2:** Use `attributes` as fallback (need to convert string arrays to values)
 
-**Conversion Logic for Attributes:**
+**Important:** Each NFT uses **either** `properties` **or** `attributes`, not both. Different NFT collections use different metadata formats.
+
+- **If `raw_metadata.attributes` exists:** Use it (array format with explicit display_type)
+- **If `raw_metadata.properties` exists:** Use it (object format with inferred types)
+- **If neither in raw_metadata:** Fall back to PostgreSQL `attributes` field (string arrays)
+
+**How Indexer-Metadata Processes Raw Metadata:**
+
+The indexer-metadata service (`flatten_raw_attrs` function) handles both formats to support all NFT collections:
+
+1. **Processing `attributes` array (if present):**
+   - Parses each attribute object with `trait_type`, `value`, `display_type`, `min_value`, `max_value`
+   - Type detection based on JSON value type:
+     - `Number` → `TraitValueType::Number`, display_type from attribute or defaults to "number"
+     - `String` → `TraitValueType::String`, display_type from attribute or defaults to "string"
+     - `Boolean` → `TraitValueType::Boolean`, display_type = "bool"
+   - Preserves `min_value` and `max_value` for numeric traits
+   - Only includes attributes with valid `VALID_DISPLAY_TYPE`: ["date", "string", "number", "number_ranking", "bool"]
+   - Groups duplicate `trait_type` values into arrays (e.g., multiple "Accessory" values)
+   - Stores trait value types in `trait_value_type` table
+
+2. **Processing `properties` object (if present):**
+   - Parses each key-value pair
+   - Type detection based on JSON value type:
+     - `Number` → `TraitValueType::Number`, display_type = "number"
+     - `String` → `TraitValueType::String`, display_type = "string"
+     - `Boolean` → `TraitValueType::Boolean`, display_type = "string" (note: stored as string)
+   - No `min_value`/`max_value` support (set to None)
+   - Stores trait value types in `trait_value_type` table
+
+**Note:** If both exist in raw_metadata (rare), properties are processed after attributes. However, in practice, each NFT uses one format or the other.
+
+**Conversion Logic for PostgreSQL `attributes` field (fallback):**
 - Extract first element from array: `["1"]` → `"1"`
 - Attempt type detection:
   - If string contains only digits → parse as integer
   - If string contains decimal → parse as float
   - If parse fails → keep as string
 - Preserve whatever type we get
+
+**Key Differences Between Attributes and Properties:**
+
+These are **alternative metadata formats** - each NFT uses one or the other:
+
+| Aspect | `raw_metadata.attributes` | `raw_metadata.properties` |
+|--------|---------------------------|---------------------------|
+| **Format** | Array of objects | Flat object |
+| **Structure** | `[{"trait_type": "X", "value": Y, "display_type": "Z"}]` | `{"X": Y}` |
+| **Type Info** | Explicit `display_type` field | Inferred from JSON value type |
+| **Min/Max Values** | Supported (`min_value`, `max_value`) | Not supported |
+| **Display Types** | Can be: "number", "number_ranking", "date", "string", "bool" | Always: "number", "string", or "string" (for bool) |
+| **Duplicate Keys** | Supported (multiple values for same `trait_type`) | Not supported (last value wins) |
+| **Validation** | Only valid `display_type` values included | All values included |
+| **Use Case** | Standard ERC721 metadata format | Alternative format used by some collections |
+
+**Example 1: NFT with `attributes` format:**
+```json
+{
+  "name": "Warrior #123",
+  "attributes": [
+    {"trait_type": "level", "value": 5, "display_type": "number", "min_value": 1, "max_value": 100},
+    {"trait_type": "rarity", "value": "Rare", "display_type": "string"},
+    {"trait_type": "accessory", "value": "Sword", "display_type": "string"},
+    {"trait_type": "accessory", "value": "Shield", "display_type": "string"}
+  ]
+}
+```
+
+**Example 2: NFT with `properties` format:**
+```json
+{
+  "name": "Warrior #456",
+  "properties": {
+    "level": 5,
+    "rarity": "Rare",
+    "tier": 3,
+    "generation": "Gen1",
+    "is_legendary": false
+  }
+}
+```
+
+**After Processing by Indexer-Metadata (from attributes format):**
+```json
+{
+  "level": {
+    "display_type": "number",
+    "value": ["5"],
+    "min_value": 1,
+    "max_value": 100
+  },
+  "rarity": {
+    "display_type": "string",
+    "value": ["Rare"],
+    "min_value": null,
+    "max_value": null
+  },
+  "accessory": {
+    "display_type": "string",
+    "value": ["Sword", "Shield"],  // Multiple values grouped from duplicate trait_type
+    "min_value": null,
+    "max_value": null
+  }
+}
+```
+
+**After Processing by Indexer-Metadata (from properties format):**
+```json
+{
+  "level": {
+    "display_type": "number",
+    "value": ["5"],
+    "min_value": null,
+    "max_value": null
+  },
+  "rarity": {
+    "display_type": "string",
+    "value": ["Rare"],
+    "min_value": null,
+    "max_value": null
+  },
+  "tier": {
+    "display_type": "number",
+    "value": ["3"],
+    "min_value": null,
+    "max_value": null
+  },
+  "generation": {
+    "display_type": "string",
+    "value": ["Gen1"],
+    "min_value": null,
+    "max_value": null
+  },
+  "is_legendary": {
+    "display_type": "string",  // Note: Boolean stored as string
+    "value": ["false"],
+    "min_value": null,
+    "max_value": null
+  }
+}
+```
+
+**Implications for Elasticsearch Indexing:**
+
+1. **Use `raw_metadata.attributes` when available** - Better type information with `display_type`
+2. **Use `raw_metadata.properties` as supplement** - Adds additional traits not in attributes
+3. **Preserve `min_value` and `max_value`** - Important for numeric range validation
+4. **Handle duplicate trait_type** - Create ES arrays for multiple values
+5. **Respect display_type** - Use it to determine ES field type mapping
+6. **Properties override attributes** - If same key exists in both, properties wins
 
 ---
 
@@ -176,81 +497,68 @@ Result: "5" < "100" (lexicographic!) ❌
 **Problem:**
 ```
 NFT #1: {level: "1"}     → ES creates field as keyword (string)
-NFT #2: {level: 5}       → Coerced to string "5"
-NFT #3: {level: 10}      → Coerced to string "10"
+NFT #2: {level: 5}       → Type mismatch, value ignored
+NFT #3: {level: 10}      → Type mismatch, value ignored
 
 Query: level >= 5
-Result: WRONG! String comparison: "5" > "10" → Returns NFT #1, #2, #3
-Correct result should be: NFT #2, #3 only
+Result: WRONG! Only NFT #1 has level indexed (as string "1")
+Correct result should be: NFT #2, #3 (and any others with numeric level)
 
 This BREAKS range queries completely! ❌
 ```
 
 **Why This Is Critical:**
 - Range queries are the primary reason for using Elasticsearch
-- If numeric traits indexed as strings → **range queries unusable**
+- If numeric traits indexed as strings → **range queries don't work**
 - Must prevent this at all costs
 
 **Real-World Impact:**
 ```
 User searches: "Show me level 5+ NFTs"
 - If correct type: Gets 1000 NFTs (level 5-100)
-- If wrong type: Gets 500 NFTs (missing level 6-9, 60-69, etc.)
-- User sees incomplete results, loses trust
+- If wrong type: Gets 0 NFTs (all numeric values ignored)
+- User sees no results, feature appears broken
 ```
 
-**Solutions:**
+**Solution: Accept First Type, Ignore Mismatches**
 
-**Option A: Pre-validation (REQUIRED for range-queryable traits)**
-- Before creating index, sample first 100-1000 NFTs
-- Identify numeric traits (level, tier, power, stats, etc.)
-- Analyze type distribution:
-  - If 95%+ are numbers → This trait should be numeric
-  - If mixed → Determine which type is correct by convention
-- Sort NFTs to index numeric-first for numeric traits
-- Ensures correct type wins
+This is expected behavior with mixed-type data:
+1. Index the data as-is (no pre-processing needed)
+2. First NFT's type wins (in this case, string)
+3. Range queries won't work for this trait (expected behavior)
 
-**Option B: Reindex on discovery**
-- When problem discovered → delete index
-- Recreate with correct type
-- Re-index all NFTs
-- Downtime required (~5-30 minutes)
+**Why this happens:**
+- Collection has inconsistent data (some numeric, some string)
+- First NFT indexed happens to have string value
+- ES locks in string type
+- All numeric values are ignored (type mismatch)
 
-**Option C: Accept and document**
-- ❌ NOT acceptable for traits that need range queries
-- Only acceptable for traits that are truly string-based
-
-**Recommendation:** 
-- MUST use Option A (pre-validation) for traits that need range queries
-- Identify common numeric traits: level, tier, rank, power, attack, defense, hp, etc.
-- These MUST be indexed as numbers
+**What happens:**
+- Mismatched types are silently ignored (handled by `ignore_malformed: true`)
+- Document still indexed (other fields work)
+- That trait's value just isn't searchable for this NFT
+- No errors, no alerts, no special handling needed
 
 ### Case 2: Type Conflict Within Collection
 
 **Problem:**
 ```
-NFT #100: {level: 1}      → Number (indexed)
-NFT #500: {level: "max"}  → String (skipped)
+NFT #100: {level: 1}      → Number (indexed) ✅
+NFT #500: {level: "max"}  → String (type mismatch, ignored) ❌
 
 Query: level >= 5
 Result: NFT #500 not returned (its level value was ignored)
 ```
 
-**Is this acceptable?**
-- If <1% of NFTs affected → Yes, acceptable
-- If >10% affected → Collection has data quality issue, should fix at source
-
-**Handling:**
-- Log when conflicts occur (which collection, which trait, which NFT)
-- Monitor conflict rate per collection
-- Alert collection owner if >10% conflict rate
-- Provide data quality report
-
-**What about the skipped NFTs?**
-- They're still indexed (other traits work)
+**What happens:**
+- Type mismatch is silently ignored (handled by `ignore_malformed: true`)
+- NFT #500 is still indexed (other traits work)
 - Still searchable by owner, token_id, other traits
 - Just missing the conflicting trait in search results
 - Full data still in `raw_metadata` for API response
+- User can still find the NFT, just not via that trait's range query
+
+**This is expected behavior** - no errors, no alerts, no special handling needed
 
 ### Case 3: NFT with >60 Traits
 
@@ -498,6 +806,73 @@ Result in ES:
     // stats not indexed
   }
 }
+```
+
+### Case 9: Attributes vs Properties Conflict (RARE EDGE CASE)
+
+**Problem:**
+In rare cases, an NFT might have both `attributes` and `properties` with conflicting data:
+```json
+{
+  "attributes": [
+    {"trait_type": "level", "value": 5, "display_type": "number"}
+  ],
+  "properties": {
+    "level": "max"  // Different type!
+  }
+}
+```
+
+**Solution: Properties Override Attributes**
+- Indexer-metadata processes attributes first, then properties
+- If same key exists in both, properties value replaces attributes value
+- This allows properties to override/correct attribute data
+
+**Processing Order:**
+1. Parse all attributes → `level: 5 (number)`
+2. Parse all properties → `level: "max" (string)` ← Overwrites!
+3. Final result: `level: "max" (string)`
+
+**Implications for ES:**
+- If attributes had numeric level first, ES field type is `long`
+- Properties sends string "max" → Fails type check
+- With `ignore_malformed: true` → Value skipped, document still indexed
+- Result: NFT indexed but level value missing
+
+**Note:** This is a rare edge case. In practice, each NFT uses either attributes OR properties, not both. This handling is defensive programming to catch all possible metadata formats.
+
+### Case 10: Display Type Validation in Attributes
+
+**Problem:**
+```json
+{
+  "attributes": [
+    {"trait_type": "level", "value": 5, "display_type": "custom_type"}
+  ]
+}
+```
+
+**Solution: Only Valid Display Types Indexed**
+- Valid types: `["date", "string", "number", "number_ranking", "bool"]`
+- Invalid types: Attribute skipped entirely
+- Trait value type still recorded in `trait_value_type` table (for analytics)
+- But attribute not included in parsed results
+
+**Example:**
+```json
+{
+  "attributes": [
+    {"trait_type": "level", "value": 5, "display_type": "number"},        // ✅ Indexed
+    {"trait_type": "rarity", "value": "Rare", "display_type": "custom"},  // ❌ Skipped
+    {"trait_type": "power", "value": 100, "display_type": "number_ranking"} // ✅ Indexed
+  ]
+}
+```
+
+**Result:**
+- `level` and `power` indexed
+- `rarity` skipped (invalid display_type)
+- All three recorded in trait_value_type table
 ```
 
 **Rationale:**
@@ -804,101 +1179,93 @@ INFO: Nested trait skipped in collection 0xa038...
 
 ---
 
-## Pre-validation Strategy
+## Migration Job Configuration
 
-### Before Creating Index
+### Environment Variables
+```bash
+# Elasticsearch
+ELASTICSEARCH_URL=http://localhost:9200
+ELASTICSEARCH_INDEX=nft-listings
 
-**Step 1: Sample Collection**
-- Fetch first 1000 NFTs from PostgreSQL
-- Extract all `raw_metadata.properties` or `attributes`
+# PostgreSQL (for migration job)
+DATABASE_URL=postgresql://user:password@localhost/marketplace_db
 
-**Step 2: Identify Range-Queryable Traits**
-
-**Critical Step:** Determine which traits users will filter by range
-
-**Common patterns for numeric traits:**
-- Names containing: level, tier, rank, power, stat, attack, defense, hp, mp, speed
-- Names containing: score, rating, point, value, amount, count, quantity
-- Names containing numbers: gen1, wave2, phase3
-
-**Heuristic:**
-- If trait name suggests progression/hierarchy → likely numeric
-- If trait appears with consistently numeric values → must be numeric
-
-**Step 3: Analyze Traits**
-- Identify all unique trait names
-- For each trait, analyze types:
-  - Count: How many times it appears
-  - Types: Distribution of JSON types (number, string, boolean)
-  - Range-queryable: Is this trait likely filtered by range?
-  - Example: "level": 950 numbers, 50 strings
-
-**Step 4: Generate Report**
-```
-Collection: 0xa038...
-Total NFTs sampled: 1000
-Total unique traits: 8
-
-Trait: level ⚠️ RANGE-QUERYABLE
-  - Appears: 1000 times (100%)
-  - Types: 95% number, 5% string
-  - Recommendation: MUST index as long (required for range queries)
-  - Action: Sort NFTs to index numbers first
-  - Priority: CRITICAL
-
-Trait: tier ⚠️ RANGE-QUERYABLE
-  - Appears: 1000 times (100%)
-  - Types: 100% number
-  - Recommendation: Index as long
-  - Action: None needed (consistent type)
-  - Priority: CRITICAL
-
-Trait: rarity
-  - Appears: 1000 times (100%)
-  - Types: 100% string
-  - Recommendation: Index as keyword
-  - Action: None needed
-  - Priority: Normal
-
-Trait: type
-  - Appears: 1000 times (100%)
-  - Types: 100% string
-  - Recommendation: Index as keyword
-  - Action: None needed
-  - Priority: Normal
-
-Trait: perk1
-  - Appears: 450 times (45%)
-  - Types: 100% string
-  - Recommendation: Index as keyword
-  - Action: None needed (optional trait)
-  - Priority: Low
+# Migration settings
+BATCH_SIZE=1000              # Documents per batch
+WORKERS=4                    # Parallel workers
+TIMEOUT_SECS=30              # Request timeout
+TOKEN_TYPE=erc721            # erc721 or erc1155
+COLLECTION_ADDRESS=0x...     # Optional: migrate specific collection only
 ```
 
-**Step 5: Sort Indexing Order (CRITICAL for Range-Queryable Traits)**
-- **For range-queryable traits with mixed types:**
-  - MUST sort NFTs to index numeric values first
-  - Example: For "level" (95% number), index NFTs with numeric level first
-  - This ensures "first type wins" gets numeric type
-  
-- **For non-range-queryable traits:**
-  - Sort by majority type (optional, nice to have)
-  - Less critical since string filtering works either way
+### Database Schema for Migration
+The migration job reads from PostgreSQL tables:
 
-**Step 6: Alert if Critical Issues Found**
+**ERC721 Table:**
+```sql
+CREATE TABLE erc721_tokens (
+    id BIGSERIAL PRIMARY KEY,
+    token_address VARCHAR(255) NOT NULL,
+    token_id VARCHAR(255) NOT NULL,
+    owner VARCHAR(255) NOT NULL,
+    name VARCHAR(255),
+    image VARCHAR(255),
+    price NUMERIC,
+    order_status VARCHAR(50),
+    attributes JSONB,           -- Processed attributes (string arrays)
+    raw_metadata JSONB,         -- Original metadata with properties/attributes
+    metadata_last_updated BIGINT,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    UNIQUE(token_address, token_id)
+);
+
+CREATE INDEX idx_erc721_token_address ON erc721_tokens(token_address);
+CREATE INDEX idx_erc721_owner ON erc721_tokens(owner);
 ```
-❌ BLOCKER: Trait "level" has mixed types (50% number, 50% string)
-   - Action required: Contact collection owner
-   - Must fix data at source before indexing
-   - Range queries will not work correctly otherwise
 
-⚠️  WARNING: Trait "power" exists but 20% are non-numeric
-   - Can proceed with sorting strategy
-   - 20% of NFTs will not appear in range queries
-   - Consider notifying collection owner
+**ERC1155 Table:**
+```sql
+CREATE TABLE erc1155_tokens (
+    id BIGSERIAL PRIMARY KEY,
+    token_address VARCHAR(255) NOT NULL,
+    token_id VARCHAR(255) NOT NULL,
+    owner VARCHAR(255) NOT NULL,
+    quantity BIGINT NOT NULL,
+    name VARCHAR(255),
+    image VARCHAR(255),
+    price NUMERIC,
+    order_status VARCHAR(50),
+    attributes JSONB,           -- Processed attributes (string arrays)
+    raw_metadata JSONB,         -- Original metadata with properties/attributes
+    metadata_last_updated BIGINT,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    UNIQUE(token_address, token_id, owner)
+);
 
-✅ OK: All critical traits have consistent types
-   - Safe to proceed with indexing
+CREATE INDEX idx_erc1155_token_address ON erc1155_tokens(token_address);
+CREATE INDEX idx_erc1155_owner ON erc1155_tokens(owner);
+```
+
+### Checkpoint File Format
+Migration progress saved to `.checkpoint.{csv_file_hash}.json`:
+
+```json
+{
+  "csv_file": "sample.csv",
+  "total_records": 10000,
+  "processed_records": 5000,
+  "completed_batches": [
+    {"start_index": 0, "batch_size": 1000},
+    {"start_index": 1000, "batch_size": 1000},
+    {"start_index": 2000, "batch_size": 1000},
+    {"start_index": 3000, "batch_size": 1000},
+    {"start_index": 4000, "batch_size": 1000}
+  ],
+  "failed_batches": 0,
+  "last_updated": "2025-10-25T10:30:00Z"
+}
 ```
 
 ---
@@ -907,27 +1274,38 @@ Trait: perk1
 
 ### Core Decisions
 
-**1. Type Handling: First Type Wins**
-- When a trait appears for the first time → ES detects type and creates field
-- Subsequent NFTs must match that type
-- If type doesn't match → value skipped (with `ignore_malformed: true`)
-- Example: If "level" first indexed as number → all string "level" values ignored
+**1. Data Source Priority**
+- **Each NFT uses either `attributes` OR `properties`, not both** (different collection formats)
+- **If `raw_metadata.attributes` exists:** Use it (array format with explicit display_type and min/max)
+- **Else if `raw_metadata.properties` exists:** Use it (object format with inferred types)
+- **Else:** Fall back to PostgreSQL `attributes` field (string arrays, requires type inference)
+- **Defensive handling:** If both exist (rare), process attributes first, then properties (properties override)
 
-**2. Multiple Values for Same Trait: ES Arrays**
+**2. Type Handling: First Type Wins, Ignore Mismatches**
+- First NFT's value determines the field type (locked in)
+- Subsequent NFTs: matching type → indexed ✅, non-matching type → ignored ❌
+- Example: If "level" first indexed as number, all string "level" values are ignored
+- Document still indexed (other fields work), just that field value skipped
+- **For attributes:** Use explicit `display_type` to determine ES field type
+- **For properties:** Infer type from JSON value type
+- **Key:** Use `ignore_malformed: true` in mapping to silently skip mismatches
+
+**3. Multiple Values for Same Trait: ES Arrays**
 - Convert from attributes array format: `[{"trait_type": "Accessory", "value": "A"}, {"trait_type": "Accessory", "value": "B"}]`
 - Group duplicate trait_type → Create ES array: `{"Accessory": ["A", "B"]}`
 - All values preserved and searchable
 - Queries use `terms` for OR logic, `bool.must` for AND between different traits
 - Pre-existing arrays in raw_metadata → ignored
+- Properties don't support duplicate keys (last value wins)
 
-**3. Field Limits**
+**4. Field Limits**
 - Total ES fields: **100 maximum** (`index.mapping.total_fields.limit: 100`)
 - Fixed fields: ~30 (token_address, owner, price, order fields, etc.)
 - Trait fields: **60 maximum**
 - Buffer: ~10 for safety
 - NFTs with >60 traits → First 60 indexed (prioritize range-queryable traits)
 
-**4. Dynamic Mapping Configuration**
+**5. Dynamic Mapping Configuration**
 - `dynamic: true` → Auto-create new trait fields
 - Dynamic templates for `properties.*` path:
   - String values → `keyword` type (exact match)
@@ -937,17 +1315,32 @@ Trait: perk1
 - Arrays supported (created from duplicate trait_type only)
 - Nested objects → skipped entirely
 
-**5. Data Not Supported (Will Be Skipped)**
+**6. Attributes-Specific Handling**
+- Only include attributes with valid `display_type`: ["date", "string", "number", "number_ranking", "bool"]
+- Invalid display_type → Attribute skipped (but type recorded in trait_value_type table)
+- Preserve `min_value` and `max_value` for numeric traits
+- Use explicit display_type instead of inferring from JSON type
+
+**7. Properties-Specific Handling**
+- Infer type from JSON value type (no explicit display_type)
+- No min/max value support
+- Boolean values stored as string display_type
+- Override attributes if same key exists
+
+**8. Data Not Supported (Will Be Skipped)**
 - ❌ Nested objects in traits
-- ❌ Pre-existing arrays in raw_metadata
+- ❌ Pre-existing arrays in raw_metadata.properties
 - ❌ Mixed types in same trait (non-numeric values in numeric fields)
 - ❌ Traits beyond 60 limit
+- ❌ Attributes with invalid display_type
 
-**6. Critical for Range Queries**
-- Pre-validation required for numeric traits (level, tier, power, etc.)
-- Must ensure numeric type wins first
-- Sort indexing order if needed
-- This is non-negotiable - range queries break if wrong type wins
+**9. Type Determination: First NFT Wins**
+- Whatever type the first NFT has for a field → that's the field type
+- If first NFT has numeric level → field is numeric (range queries work) ✅
+- If first NFT has string level → field is string (range queries don't work) ❌
+- No pre-validation needed, no sorting required
+- Just index the data as-is, first value determines type
+- Accept that some collections may have type mismatches (handled by `ignore_malformed`)
 
 ---
 
@@ -956,52 +1349,148 @@ Trait: perk1
 ### Core Principles
 1. **Range queries are the primary goal** (why we need ES)
 2. **One index per collection** (isolated schemas)
-3. **First type wins** (ES dynamic mapping behavior)
-4. **Numeric types are critical** (required for range queries)
-5. **Pre-validate range-queryable traits** (MUST get type right)
-6. **Ignore malformed** (graceful degradation for edge cases)
-7. **Log everything** (monitor edge cases)
+3. **First type wins** (ES dynamic mapping behavior - no pre-validation needed)
+4. **Ignore mismatches** (graceful degradation for type conflicts with `ignore_malformed: true`)
 
-### Critical Success Factors
-1. **Identify range-queryable traits before indexing**
-   - Common patterns: level, tier, rank, power, stats
-   - MUST be indexed as numeric types
-   
-2. **Pre-validation is mandatory for numeric traits**
-   - Sample collection first
-   - Analyze type distribution
-   - Sort indexing order if needed
-   
-3. **Range query correctness > Everything else**
-   - If numeric trait indexed as string → Entire ES solution fails
-   - Users get wrong/incomplete results
-   - Better to block indexing than index with wrong type
+### How It Works
+1. **Index data as-is** - no pre-processing or sorting required
+2. **First NFT's value type** determines the field type (locked in)
+3. **Subsequent NFTs:**
+   - Matching type → indexed ✅
+   - Non-matching type → ignored ❌ (document still indexed)
+4. **Result:** Simple, predictable behavior
 
 ### Acceptable Trade-offs
-- NFTs with non-numeric values in numeric fields: Values skipped but document indexed (<10% acceptable)
+- NFTs with non-numeric values in numeric fields: Values skipped but document indexed
 - NFTs with >60 traits: Extra traits not indexed (rare edge case)
 - Nested object traits: Skipped entirely, not indexed
-- Type conflicts <10%: Acceptable data quality
+- Type conflicts: Silently ignored (handled by `ignore_malformed: true`)
 - Empty/null values: Excluded from queries (expected behavior)
-
-### Unacceptable Scenarios
-- ❌ Range-queryable trait indexed as string (breaks primary use case)
-- ❌ Wrong type wins first for numeric traits (use pre-validation)
-- ❌ Indexing failures (use ignore_malformed to prevent)
-- ❌ Type conflict rate >10% (alert collection owner, may need data fix)
-
-### When to Block Indexing
-- Range-queryable trait has 50/50 mixed types
-- More than 20% type conflicts for critical numeric traits
-- Data quality too poor to provide correct results
-
-### When to Alert Collection Owner
-- Range-queryable trait has >10% non-numeric values
-- Trait count >60 in multiple NFTs (exceeding limit)
-- Nested object traits detected (will be skipped)
-- Large percentage of null/empty values
 
 ---
 
-**Status:** Core strategy designed, range query support prioritized  
-**Next:** Implement mapping template and pre-validation tool with range query focus
+---
+
+## Rollout Strategy
+
+### Phase 1: Setup & Validation (Week 1)
+1. Deploy Elasticsearch cluster
+2. Create indexes with proper mappings
+3. Run migration job on staging environment
+4. Validate data integrity:
+   - Compare document counts
+   - Spot-check trait values
+   - Verify range queries work correctly
+5. Performance testing:
+   - Benchmark query latency
+   - Compare PostgreSQL vs Elasticsearch
+
+### Phase 2: Double-Write Deployment (Week 2)
+1. Deploy double-write code to production
+2. Monitor ES write failures
+3. Verify data consistency between PostgreSQL and ES
+4. Keep PostgreSQL as primary source of truth
+5. Run migration job on production (off-peak hours)
+
+### Phase 3: Query Migration (Week 3)
+1. Deploy query service with ES support
+2. Implement fallback to PostgreSQL
+3. Monitor query latency and error rates
+4. Gradually increase ES query traffic
+5. Keep PostgreSQL queries as fallback
+
+### Phase 4: Cleanup (Week 4+)
+1. Once ES is stable and queries are fast:
+   - Remove PostgreSQL fallback
+   - Deprecate PostgreSQL trait queries
+   - Keep PostgreSQL for archival/backup
+2. Monitor for any issues
+3. Document lessons learned
+
+---
+
+## Monitoring & Alerting
+
+### Metrics to Track
+
+**Elasticsearch Health:**
+- Cluster health status (green/yellow/red)
+- Index size and document count
+- Query latency (p50, p95, p99)
+- Indexing latency
+- Failed bulk requests
+
+**Data Consistency:**
+- Document count: PostgreSQL vs Elasticsearch
+- Trait value mismatches
+- Type conflict rate (% of documents with type mismatches)
+- Field limit exceeded rate
+
+**Migration Job:**
+- Documents processed per second
+- Batch success/failure rate
+- Checkpoint save frequency
+- Total migration time
+
+### Alerts to Set Up
+
+**Critical:**
+- ES cluster health is red
+- Bulk indexing failure rate >5%
+- Query latency >500ms
+- Document count mismatch >1%
+
+**Warning:**
+- ES cluster health is yellow
+- Bulk indexing failure rate >1%
+- Query latency >200ms
+- Type conflict rate >5%
+- Field limit exceeded in any collection
+
+---
+
+## Troubleshooting Guide
+
+### Issue: Type Conflicts in Elasticsearch
+**Symptom:** Range queries return no results for numeric traits
+
+**Cause:** First NFT indexed had string value, field locked as keyword
+
+**Solution:**
+1. Check which NFT was indexed first
+2. If data is wrong, delete index and re-migrate
+3. If data is correct, accept that trait isn't range-queryable for this collection
+4. Document in collection config
+
+### Issue: Bulk Indexing Failures
+**Symptom:** Migration job reports failed batches
+
+**Cause:**
+- ES cluster out of memory
+- Malformed documents
+- Field limit exceeded
+
+**Solution:**
+1. Check ES logs for specific errors
+2. Reduce batch size if memory issue
+3. Validate document structure
+4. Increase field limit if needed
+
+### Issue: Query Latency High
+**Symptom:** ES queries slower than PostgreSQL
+
+**Cause:**
+- Index not optimized
+- Too many shards/replicas
+- Queries not using indexes
+
+**Solution:**
+1. Check query execution plan
+2. Verify indexes are being used
+3. Adjust shard/replica count
+4. Consider query optimization
+
+---
+
+**Status:** Architecture and strategy documented
+**Next:** Implement double-write in main application and migration job

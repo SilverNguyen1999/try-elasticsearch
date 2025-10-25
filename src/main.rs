@@ -2,6 +2,8 @@ mod checkpoint;
 mod config;
 mod elasticsearch;
 mod models;
+mod models_flexible;
+mod collection_config;
 
 use anyhow::{Context, Result};
 use csv::ReaderBuilder;
@@ -16,7 +18,8 @@ use tokio::signal;
 use crate::checkpoint::MigrationCheckpoint;
 use crate::config::APP_CONFIG;
 use crate::elasticsearch::bulk_index_documents;
-use crate::models::{CsvRecord, ElasticsearchDocument};
+use crate::models_flexible::{CsvRecord, FlexibleElasticsearchDocument};
+use crate::collection_config::get_collection_config;
 
 #[tokio::main]
 async fn main() -> Result<()> {
