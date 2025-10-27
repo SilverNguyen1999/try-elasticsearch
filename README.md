@@ -1,241 +1,114 @@
-# ERC721 Elasticsearch Migrator
+# ERC721 Elasticsearch Integration
 
 ## 🎯 Project Goal
 
-**Find the optimal way to index NFT data in Elasticsearch for a multi-collection marketplace** where each collection has completely different properties, while maintaining fast search performance.
+**Migrate NFT marketplace from PostgreSQL to Elasticsearch for 20-40x faster query performance** on complex filters and range queries across multi-collection NFT data.
 
-**Status:** ✅ Solution designed - Per-collection indexing with dynamic field extraction (industry standard)
+## 📚 Documentation
 
-A high-performance Rust application for migrating ERC721 NFT data from CSV files to Elasticsearch.
+**→ See [PROJECT_NOTES.md](PROJECT_NOTES.md) for complete architecture and implementation strategy**
 
-## Features
+This document covers:
+- ✅ Why Elasticsearch (performance problem analysis)
+- ✅ ES document structure and field mapping
+- ✅ Type handling strategy (first type wins)
+- ✅ Edge cases and solutions (60+ scenarios)
+- ✅ Data synchronization strategy (order data, ownership, metadata)
+- ✅ Event handlers that need ES updates
+- ✅ GraphQL query translation
+- ✅ Complete code file paths for implementation
+- ✅ Rollout strategy (double-write → migration → query switch)
 
-- **High Performance**: Built in Rust with async/await and concurrent processing
-- **Flexible Attribute Mapping**: Handles dynamic NFT attributes using Elasticsearch's flattened field type
-- **Bulk Indexing**: Efficient batch processing with configurable batch sizes
-- **Resume/Checkpoint**: Automatic progress saving and resume from interruptions
-- **Graceful Shutdown**: Ctrl+C saves progress before exit
-- **Error Handling**: Robust error handling with retry capabilities
-- **Concurrent Workers**: Configurable number of concurrent workers for optimal throughput
+## 🚀 Quick Start
 
-## Prerequisites
+This repository contains the **migration job** to move existing PostgreSQL data to Elasticsearch.
 
-- Rust 1.70+ installed
-- Elasticsearch running (default: localhost:9300)
-- CSV file with ERC721 data
+**Main application:** `mavis-marketplace-services` (event handlers + GraphQL queries)
 
-## Installation
+## 🏗️ Architecture Overview
 
-```bash
-# Navigate to the project directory
-cd /path/to/migrate-sample-erc721-data
+### Three Main Components
 
-# Build the project
-cargo build --release
-```
+**1. Double-Write (Event Handlers)**
+- Location: `mavis-marketplace-services/indexer/indexer/`
+- Updates both PostgreSQL AND Elasticsearch on every event
+- Events: ERC721 Transfer, Order Created/Matched/Cancelled, Metadata Updated
 
-## Configuration
+**2. Migration Job (This Repository)**
+- Reads existing data from PostgreSQL `erc721` table
+- Transforms and bulk indexes to Elasticsearch
+- Supports checkpoint/resume for large datasets
 
-The application uses environment variables for configuration. Copy `env.example` to `.env` and modify as needed:
+**3. Query Service (GraphQL)**
+- Location: `mavis-marketplace-services/graphql/mavis-graphql-token/`
+- Translates GraphQL filters to Elasticsearch queries
+- 20-40x performance improvement over PostgreSQL
 
-```bash
-cp env.example .env
-```
+See [PROJECT_NOTES.md](PROJECT_NOTES.md) for detailed architecture, data flow, and implementation guide.
 
-### Environment Variables
+---
 
-- `ELASTICSEARCH_URL`: Elasticsearch endpoint (default: http://localhost:9300)
-- `ELASTICSEARCH_INDEX`: Index name (default: nft_tokens)
-- `BATCH_SIZE`: Documents per batch (default: 2000)
-- `WORKERS`: Concurrent workers (default: 6)
-- `TIMEOUT_SECS`: HTTP timeout (default: 30)
+## 🔑 Key Design Decisions
 
-## Usage
+### One Index Per Collection
+Each NFT collection gets its own ES index (e.g., `erc721_0xa038...`).
+- **Why:** Different collections have completely different traits
+- **Benefit:** No field limit conflicts, optimized per collection
 
-### Basic Usage
-```bash
-./target/release/erc721-elasticsearch-migrator data.csv
-```
-
-### With Custom Environment
-```bash
-# Override specific settings
-BATCH_SIZE=5000 WORKERS=8 ./target/release/erc721-elasticsearch-migrator data.csv
-```
-
-## Resume/Checkpoint Feature
-
-The migrator automatically saves progress and can resume from interruptions:
-
-### Automatic Checkpointing
-- Progress is saved every 10 batches
-- Checkpoint file: `<csv_filename>.checkpoint`
-- Contains: processed records, batch counts, timestamps
-
-### Resume Migration
-```bash
-# Simply run the same command - it will automatically resume
-./target/release/erc721-elasticsearch-migrator data.csv
-
-# Output will show:
-# 📁 Found checkpoint: 45.2% complete (678000/1500000 records)
-# 🔄 Resuming from record 678000
-```
-
-### Graceful Shutdown
-- Press `Ctrl+C` to stop migration safely
-- Progress is saved before exit
-- Resume later with the same command
-
-### Manual Checkpoint Management
-```bash
-# View checkpoint status
-cat data.csv.checkpoint
-
-# Remove checkpoint to restart from beginning
-rm data.csv.checkpoint
-```
-
-## CSV Format
-
-The CSV file should contain the following columns:
-- `token_address`: Contract address of the NFT
-- `token_id`: Unique token ID
-- `owner`: Current owner address
-- `name`: NFT name
-- `attributes`: JSON string containing NFT attributes
-- `price`, `ron_price`: Pricing information
-- `image`, `cdn_image`: Image URLs
-- And many more fields...
-
-### Example CSV Row
-```csv
-token_address,token_id,name,attributes,price,ron_price,...
-0xa038c593115f6fcd673f6833e15462b475994879,409192,Archer,"{""tier"": [""1""], ""type"": [""archer""], ""rarity"": [""common""]}",100.5,95.2,...
-```
-
-## Elasticsearch Index Mapping
-
-The application expects an Elasticsearch index with the following key features:
-
-- **Flattened attributes field**: For dynamic NFT trait filtering
-- **Proper field types**: Optimized for search and aggregation
-- **Scalable design**: Handles millions of NFT records
-
-### Create the Index
-Before running the migrator, create the Elasticsearch index:
-
-```bash
-curl -X PUT "localhost:9300/nft_tokens" -H 'Content-Type: application/json' -d '{
-  "mappings": {
-    "properties": {
-      "token_address": { "type": "keyword" },
-      "token_id": { "type": "keyword" },
-      "owner": { "type": "keyword" },
-      "name": { "type": "text", "fields": { "keyword": { "type": "keyword" } } },
-      "attributes": { "type": "flattened", "depth_limit": 20 },
-      "price": { "type": "double" },
-      "ron_price": { "type": "double" },
-      "is_shown": { "type": "boolean" }
-    }
+### Dynamic Properties with Type Detection
+```json
+{
+  "properties": {
+    "level": 5,           // double (first NFT had number)
+    "rarity": "common",   // keyword (first NFT had string)
+    "tribe": "Bageni"     // keyword
   }
-}'
+}
 ```
+- **Strategy:** First type wins, `ignore_malformed: true` for mismatches
+- **Limit:** 60 traits per NFT, 100 total fields per index
 
-## Performance
+### Full Data Synchronization
+Not just metadata! ES documents include:
+- **Ownership:** owner, is_shown, ownership_block_number
+- **Order Data:** price, order_status, maker, expired_at, etc.
+- **Metadata:** name, image, properties (dynamic traits), raw_metadata
 
-The migrator is optimized for high performance:
+**Why:** Support sorting and filtering on orders/ownership (current PostgreSQL requirement)
 
-- **Concurrent Processing**: Multiple workers process batches in parallel
-- **Bulk API**: Uses Elasticsearch's bulk API for efficient indexing
-- **Memory Efficient**: Streams CSV data to avoid loading entire file in memory
-- **Progress Tracking**: Real-time feedback on migration progress
+---
 
-### Performance Tips
-
-1. **Increase batch size** for larger datasets (2000-5000)
-2. **Adjust worker count** based on your CPU cores and Elasticsearch cluster
-3. **Monitor Elasticsearch** cluster health during migration
-4. **Use SSD storage** for both CSV file and Elasticsearch data
-
-## Example Output
+## 📂 Repository Structure
 
 ```
-2023-09-29T10:30:00Z INFO  Starting ERC721 Elasticsearch migration
-2023-09-29T10:30:00Z INFO  CSV file: "nft_data.csv"
-2023-09-29T10:30:00Z INFO  Elasticsearch URL: http://localhost:9300
-2023-09-29T10:30:00Z INFO  Elasticsearch connection verified
-2023-09-29T10:30:05Z INFO  Finished reading 1500000 records from CSV
-2023-09-29T10:30:05Z INFO  Processing 1500 batches with 4 workers
-[00:05:23] ████████████████████████████████████████ 1500000/1500000 Indexed 1500000 documents
-2023-09-29T10:35:28Z INFO  Migration summary:
-2023-09-29T10:35:28Z INFO    Total records: 1500000
-2023-09-29T10:35:28Z INFO    Successfully processed: 1500000
-2023-09-29T10:35:28Z INFO    Successful batches: 1500
-2023-09-29T10:35:28Z INFO    Failed batches: 0
-2023-09-29T10:35:28Z INFO  All batches processed successfully!
-```
-
-## Querying the Data
-
-Once migrated, you can query your NFT data with complex filters:
-
-```bash
-# Search by name
-curl -X GET "localhost:9300/nft_tokens/_search" -H 'Content-Type: application/json' -d '{
-  "query": { "match": { "name": "Archer" } }
-}'
-
-# Filter by attributes
-curl -X GET "localhost:9300/nft_tokens/_search" -H 'Content-Type: application/json' -d '{
-  "query": {
-    "bool": {
-      "must": [
-        { "term": { "attributes.rarity": "common" } },
-        { "term": { "attributes.type": "archer" } }
-      ]
-    }
-  }
-}'
-
-# Price range query with sorting
-curl -X GET "localhost:9300/nft_tokens/_search" -H 'Content-Type: application/json' -d '{
-  "query": { "range": { "ron_price": { "gte": 10, "lte": 100 } } },
-  "sort": [{ "ron_price": { "order": "asc" } }]
-}'
+migrate-sample-erc721-data/
+├── src/
+│   ├── main.rs              # (To be implemented)
+│   ├── config.rs            # (Existing config)
+│   ├── elasticsearch.rs     # (To be updated for ES client)
+│   └── ...
+├── PROJECT_NOTES.md         # 📚 Complete implementation guide
+├── README.md                # This file
+└── Cargo.toml               # Dependencies
 ```
 
 ---
 
-## 🎯 Multi-Collection Marketplace
+## 🚦 Implementation Status
 
-**Question:** "Each collection has different properties. How to make it flexible AND fast?"
+**Documentation:** ✅ Complete (see PROJECT_NOTES.md)
 
-**Answer:** Use **one index per collection** + **collection registry**
-
-See **[MULTI_COLLECTION_STRATEGY.md](MULTI_COLLECTION_STRATEGY.md)** for the full explanation.
-
-**Quick summary:**
-- One index per collection address
-- Registry defines optimized fields per collection: `src/collection_config.rs`
-- Unknown collections still work (just less optimized)
-- Performance: 10-50x faster than PostgreSQL
+**Code Implementation:** ⏳ Pending
+- [ ] ES client module
+- [ ] ES mapping template
+- [ ] Migration job (read from Postgres → write to ES)
+- [ ] Event handlers (double-write to ES)
+- [ ] GraphQL query translator (ES queries)
 
 ---
 
-## Troubleshooting
+## 📖 Further Reading
 
-### Common Issues
-
-1. **Connection refused**: Ensure Elasticsearch is running on the specified port
-2. **Index already exists**: Delete the index first or use a different name
-3. **Out of memory**: Reduce batch size or worker count
-4. **CSV parsing errors**: Check CSV format and encoding
-
-### Logs
-
-The application provides detailed logging. Set `RUST_LOG=debug` for verbose output:
-
-```bash
-RUST_LOG=debug ./target/release/erc721-elasticsearch-migrator --csv-file data.csv
-```
+- **[PROJECT_NOTES.md](PROJECT_NOTES.md)** - Complete architecture, edge cases, implementation guide
+- **Elasticsearch Docs:** [Dynamic Mapping](https://www.elastic.co/guide/en/elasticsearch/reference/current/dynamic-mapping.html)
+- **Performance Analysis:** See "GraphQL Query Performance Problem" section in PROJECT_NOTES.md
