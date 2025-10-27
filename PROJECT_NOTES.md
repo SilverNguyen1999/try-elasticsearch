@@ -70,25 +70,7 @@ async fn create_listing(nft: NFT) -> Result<()> {
 - Support resumable migration with checkpoints
 - Support both ERC721 and ERC1155
 
-**Features:**
-- Checkpoint-based resumable migration
-- Batch processing (configurable batch size)
-- Parallel workers for throughput
-- Progress tracking and logging
-- Graceful shutdown with checkpoint save
-
-**Execution:**
-```bash
-# Migrate ERC721 data
-cargo run --release -- --token-type erc721
-
-# Migrate ERC1155 data
-cargo run --release -- --token-type erc1155
-
-# Resume interrupted migration
-cargo run --release -- --token-type erc721
-# Automatically resumes from last checkpoint
-```
+**Note:** Implementation structure to be determined
 
 ### 3. Query Service (In Main Application)
 **Location:** `mavis-marketplace-services` (or similar)
@@ -174,62 +156,525 @@ Result: "5" < "100" (lexicographic!) ❌
 
 ---
 
+## Complete Data Model: Not Just Metadata!
+
+### Critical Understanding: ES Must Store Order Data for Sorting
+
+**The Problem:** Current GraphQL queries (`erc721_tokens`) need to:
+1. Filter by NFT attributes/traits (JSONB with GIN index) ← Slow
+2. Sort by order fields (price, started_at, etc.) ← Requires denormalized data
+3. Filter by order status, owner, auction type ← Requires joins or denormalization
+
+**Current PostgreSQL Approach:**
+- **Denormalized design:** Order data stored directly in `erc721` table rows
+- **Why:** ERC721 tokens are unique (1 token = 1 owner), so denormalizing order data into the NFT row enables sorting without joins
+- **Trade-off:** Must update erc721 row when orders created/matched/cancelled
+
+**Elasticsearch Must Match This Design:**
+- Store order data in each NFT document
+- Update ES when order events occur
+- Enable sorting on price, started_at, ron_price, etc.
+
+---
+
 ## ERC721 vs ERC1155 Differences
 
-### ERC721 (Non-Fungible Tokens)
-- **One token per token_id**
-- **Unique ownership** - each token owned by one address
-- **Example:** Axie Infinity Units, Lands
-- **Elasticsearch:** One document per token_id
+### ERC721 (Non-Fungible Tokens) - PRIMARY FOCUS
 
-**Data Structure:**
+**Characteristics:**
+- **One token per token_id** - globally unique
+- **One owner per token** - cannot be shared
+- **Quantity always 1** - non-fungible
+- **Example:** Axie Infinity Units, Lands, Art NFTs
+
+**PostgreSQL Schema (from tracker_database_migration.sql):**
+```sql
+CREATE TABLE erc721 (
+    -- Identity
+    token_address varchar NOT NULL,
+    token_id numeric(78) NOT NULL,
+    
+    -- Ownership
+    owner varchar NOT NULL,
+    is_shown bool DEFAULT true NULL,
+    ownership_block_number int8 DEFAULT 0 NULL,
+    ownership_log_index int4 DEFAULT 0 NULL,
+    received_timestamp int8 NULL,
+    
+    -- Order data (denormalized for sorting!)
+    order_id int8 NULL,
+    maker varchar NULL,
+    matcher varchar NULL,
+    kind int8 NULL,
+    base_price numeric(78) NULL,
+    ended_price numeric(78) NULL,
+    price numeric(78) NULL,
+    ron_price numeric(78) NULL,
+    started_at int8 NULL,
+    ended_at int8 NULL,
+    expired_at int8 NULL,
+    payment_token varchar NULL,
+    order_status varchar NULL,
+    state varchar NULL,
+    
+    -- Metadata
+    name varchar NULL,
+    attributes jsonb NULL,           -- Processed (string arrays)
+    raw_metadata jsonb NULL,         -- Original (proper types)
+    image varchar NULL,
+    cdn_image varchar NULL,
+    video varchar NULL,
+    animation_url varchar NULL,
+    description varchar NULL,
+    metadata_last_updated int8 NULL,
+    cached_image_path varchar NULL,
+    
+    PRIMARY KEY (token_address, token_id)
+) PARTITION BY LIST (token_address);
+```
+
+**Elasticsearch Document Structure (MUST match Postgres):**
 ```json
 {
-  "token_address": "0x...",
-  "token_id": "123",
-  "owner": "0x...",
-  "properties": { /* traits */ }
+  // Identity
+  "token_address": "0xa038...",
+  "token_id": "409192",
+  
+  // Ownership (updated on Transfer)
+  "owner": "0x123...",
+  "is_shown": true,
+  "ownership_block_number": 12345678,
+  "ownership_log_index": 42,
+  "received_timestamp": 1698765432,
+  
+  // Order data (updated on OrderCreated/Matched/Cancelled)
+  "order_id": 98765,
+  "maker": "0xabc...",
+  "matcher": null,
+  "kind": 1,                        // OrderType enum
+  "base_price": 1000000000000000000,
+  "ended_price": null,
+  "price": 1500000000000000000,     // Last sale price
+  "ron_price": 100.5,               // Price in RON for sorting
+  "started_at": 1698765000,
+  "ended_at": null,
+  "expired_at": 1698865000,
+  "payment_token": "0xc99a...",
+  "order_status": "Open",           // "Open", "Matched", "Cancelled", etc.
+  "state": "active",
+  
+  // Metadata
+  "name": "Archer #409192",
+  "properties": {
+    "tier": 0,
+    "level": 1,
+    "rarity": "common"
+  },
+  "image": "https://...",
+  "cdn_image": "https://...",
+  "video": null,
+  "animation_url": null,
+  "description": "...",
+  "metadata_last_updated": 1698700000,
+  "raw_metadata": { /* full original */ }
 }
 ```
 
-### ERC1155 (Semi-Fungible Tokens)
-- **Multiple tokens per token_id** (different quantities)
-- **Shared metadata** - same token_id can have different owners
-- **Example:** Items, Potions, Consumables
-- **Elasticsearch:** One document per (token_id, owner) pair OR per token_id with quantity
+**Key Design Decision:** Order data denormalized into NFT document for efficient sorting
+- Sorting by `price`, `ron_price`, `started_at` without joins
+- Filtering by `order_status`, `maker` without joins
+- Single document update when order changes
 
-**Data Structure Option 1 (Per Owner):**
+### ERC1155 (Semi-Fungible Tokens) - SECONDARY
+
+**Characteristics:**
+- **Multiple tokens per token_id** - quantity-based
+- **Multiple owners** - same token_id owned by different addresses
+- **Variable quantity** - fungible within token_id
+- **Example:** Items, Potions, Consumables, Resources
+
+**PostgreSQL Schema:**
+```sql
+-- Metadata table (one row per token_id)
+CREATE TABLE erc1155_data (
+    token_address varchar NOT NULL,
+    token_id numeric NOT NULL,
+    
+    -- Metadata (shared across all owners)
+    name varchar NULL,
+    attributes jsonb NULL,
+    raw_metadata jsonb NULL,
+    image varchar NULL,
+    cdn_image varchar NULL,
+    video varchar NULL,
+    animation_url varchar NULL,
+    description varchar NULL,
+    metadata_last_updated int8 NULL,
+    
+    -- Aggregated stats
+    total_owners int8 DEFAULT 0 NULL,
+    total_items numeric DEFAULT 0 NULL,
+    total_listing int8 DEFAULT 0 NULL,
+    total_items_listing numeric DEFAULT 0 NULL,
+    min_price numeric(78) NULL,
+    
+    PRIMARY KEY (token_address, token_id)
+) PARTITION BY LIST (token_address);
+
+-- Ownership tracked separately (not shown, likely in balances table)
+```
+
+**Elasticsearch Document Structure (ERC1155):**
 ```json
 {
   "token_address": "0x...",
-  "token_id": "123",
-  "owner": "0x...",
-  "quantity": 5,
-  "properties": { /* traits */ }
+  "token_id": "456",
+  
+  // Metadata (shared)
+  "name": "Magic Potion",
+  "properties": {
+    "rarity": "rare",
+    "effect": "healing"
+  },
+  
+  // Aggregated data
+  "total_owners": 150,
+  "total_items": 5000,
+  "total_listing": 20,
+  "total_items_listing": 500,
+  "min_price": 50000000000000000,
+  
+  // Metadata
+  "image": "https://...",
+  "raw_metadata": { /* full original */ }
 }
 ```
 
-**Data Structure Option 2 (Per Token):**
+**Key Differences:**
+- ERC1155: Metadata stored once per token_id, ownership tracked separately
+- ERC721: All data (metadata + ownership + order) in one document
+- ERC1155: Sorting by min_price (across all listings)
+- ERC721: Sorting by individual NFT's price
+
+**For This Project: Focus on ERC721**
+- More complex (denormalized order data)
+- Higher query volume
+- More performance-critical
+- ERC1155 can be added later (simpler, just metadata)
+
+---
+
+## Events That Trigger ES Updates
+
+### 1. ERC721 Transfer (Owner Changed)
+
+**Event Source:** `indexer/src/event/erc721_transfer.rs`
+
+**What Happens:**
+```rust
+// Updates in erc721 table:
+- owner = new_owner
+- is_shown = !EXCLUDED_ADDRESSES.contains(new_owner)  // false if burnt!
+- ownership_block_number = event.block_number
+- ownership_log_index = event.log_index
+- received_timestamp = block_timestamp
+
+// EXCLUDED_ADDRESSES = [ZERO_ADDRESS, DEAD_ADDRESS, ...]
+// If NFT transferred to excluded address → it's burnt → is_shown = false
+```
+
+**ES Update Required:**
 ```json
 {
-  "token_address": "0x...",
-  "token_id": "123",
-  "owners": [
-    {"address": "0x...", "quantity": 5},
-    {"address": "0x...", "quantity": 3}
+  "doc": {
+    "owner": "0xnew_owner...",
+    "is_shown": true,  // false if burnt (owner in EXCLUDED_ADDRESSES)
+    "ownership_block_number": 12345678,
+    "ownership_log_index": 42,
+    "received_timestamp": 1698765432
+  }
+}
+```
+
+**Important: Burnt NFTs**
+- If `new_owner` is in `EXCLUDED_ADDRESSES` (0x0, 0xdead, etc.) → NFT is burnt
+- `is_shown = false` → NFT won't appear in marketplace listings
+- Still indexed in ES but filtered out by `is_shown` query
+- Common in games: burn items, burn land, etc.
+
+**Trigger:** Every NFT transfer (mint, sale, transfer, burn)
+**Frequency:** High (thousands per day)
+**Critical:** Yes (owner and is_shown must be up-to-date)
+
+### 2. Order Created (Listing/Offer Made)
+
+**Event Source:** `indexer/src/event/order_exchange.rs` → `OrderCreated`
+
+**What Happens:**
+```rust
+// Order table INSERT
+// erc721 table UPDATE (for Sell orders):
+- order_id = new_order.id
+- maker = new_order.maker
+- kind = new_order.kind
+- base_price = new_order.base_price
+- ended_price = new_order.ended_price
+- started_at = new_order.started_at
+- ended_at = new_order.ended_at
+- expired_at = new_order.expired_at
+- payment_token = new_order.payment_token
+- order_status = "Open"
+- ron_price = converted_price
+```
+
+**ES Update Required:**
+```json
+{
+  "doc": {
+    "order_id": 98765,
+    "maker": "0xmaker...",
+    "kind": 1,
+    "base_price": 1000000000000000000,
+    "ended_price": null,
+    "started_at": 1698765000,
+    "ended_at": null,
+    "expired_at": 1698865000,
+    "payment_token": "0xc99a...",
+    "order_status": "Open",
+    "ron_price": 100.5
+  }
+}
+```
+
+**Trigger:** User creates listing or offer
+**Frequency:** Medium (hundreds per day)
+**Critical:** Yes (must be searchable/sortable immediately)
+
+### 3. Order Matched (Sale Completed)
+
+**Event Source:** `indexer/src/event/order_exchange.rs` → `OrderMatched`
+
+**What Happens:**
+```rust
+// erc721 table UPDATE:
+- maker = NULL
+- order_id = NULL
+- kind = NULL
+- base_price = NULL
+- ended_price = NULL
+- started_at = NULL
+- ended_at = NULL
+- expired_at = NULL
+- payment_token = NULL
+- order_status = NULL
+- ron_price = NULL
+- matcher = matcher_address
+- price = final_sale_price
+```
+
+**ES Update Required:**
+```json
+{
+  "doc": {
+    "order_id": null,
+    "maker": null,
+    "kind": null,
+    "base_price": null,
+    "ended_price": null,
+    "started_at": null,
+    "ended_at": null,
+    "expired_at": null,
+    "payment_token": null,
+    "order_status": null,
+    "ron_price": null,
+    "matcher": "0xmatcher...",
+    "price": 1500000000000000000
+  }
+}
+```
+
+**Trigger:** Order is filled (sale completed)
+**Frequency:** Medium (hundreds per day)
+**Critical:** Yes (must remove from active listings immediately)
+
+### 4. Order Cancelled
+
+**Event Source:** `indexer/src/event/order_exchange.rs` → `OrderCancelledVec`
+
+**What Happens:**
+```rust
+// erc721 table UPDATE (for Sell orders):
+- maker = NULL
+- order_id = NULL
+- kind = NULL
+- base_price = NULL
+- ended_price = NULL
+- started_at = NULL
+- ended_at = NULL
+- expired_at = NULL
+- payment_token = NULL
+- order_status = NULL
+- ron_price = NULL
+```
+
+**ES Update Required:**
+```json
+{
+  "doc": {
+    "order_id": null,
+    "maker": null,
+    "kind": null,
+    "base_price": null,
+    "ended_price": null,
+    "started_at": null,
+    "ended_at": null,
+    "expired_at": null,
+    "payment_token": null,
+    "order_status": null,
+    "ron_price": null
+  }
+}
+```
+
+**Trigger:** User cancels listing or offer
+**Frequency:** Medium (hundreds per day)
+**Critical:** Yes (must remove from active listings immediately)
+
+### 5. Metadata Updated
+
+**Event Source:** `indexer-metadata` service (separate from indexer)
+
+**What Happens:**
+```rust
+// erc721 table UPDATE:
+- name = new_metadata.name
+- attributes = processed_attributes
+- raw_metadata = original_metadata
+- image = new_metadata.image
+- cdn_image = cached_image
+- metadata_last_updated = timestamp
+```
+
+**ES Update Required:**
+```json
+{
+  "doc": {
+    "name": "Updated Name",
+    "properties": {
+      "tier": 1,
+      "level": 5,
+      "rarity": "epic"
+    },
+    "image": "https://...",
+    "cdn_image": "https://...",
+    "metadata_last_updated": 1698800000,
+    "raw_metadata": { /* updated */ }
+  }
+}
+```
+
+**Trigger:** NFT metadata refresh (mint, manual refresh, scheduled refresh)
+**Frequency:** Low-Medium (metadata updates are less frequent)
+**Critical:** Medium (metadata changes are important but not time-critical)
+
+---
+
+## GraphQL Query Performance Problem
+
+### Current Query: `erc721_tokens` (mavis-graphql-token/src/schema.rs)
+
+**Query Pattern:**
+```graphql
+query GetERC721TokensList(
+  $tokenAddress: String
+  $owner: String
+  $auctionType: AuctionType
+  $criteria: [SearchCriteria!]          # Trait filters: [{name: "rarity", values: ["Rare"]}]
+  $rangeCriteria: [RangeSearchCriteria!] # Range filters: [{name: "level", min: 5, max: 100}]
+  $priceRange: InputRange                # Price range
+  $name: String                          # Name search
+  $from: Int
+  $size: Int
+  $sort: SortBy                          # "PriceAsc", "PriceDesc", "RecentlyListed", etc.
+) {
+  erc721Tokens(...)
+}
+```
+
+**Example Real Query:**
+```graphql
+{
+  tokenAddress: "0xa038c593115f6fcd673f6833e15462b475994879"
+  auctionType: "Sale"
+  criteria: [
+    {name: "Accessory", values: ["Snot Bubble", "Omamori"]},
+    {name: "Tribe", values: ["Bageni"]}
+  ]
+  rangeCriteria: [
+    {name: "level", min: 5}
+  ]
+  sort: "PriceAsc"
+  from: 0
+  size: 50
+}
+```
+
+**Current PostgreSQL Query (Slow!):**
+```sql
+SELECT *
+FROM erc721
+WHERE token_address = '0xa038...'
+  AND is_shown = true
+  AND order_status = 'Open'
+  AND attributes @> '{"Accessory": ["Snot Bubble"]}'  -- JSONB containment (slow!)
+  OR attributes @> '{"Accessory": ["Omamori"]}'
+  AND attributes @> '{"Tribe": ["Bageni"]}'
+  AND (attributes->'level'->>0)::int >= 5             -- Type cast (can't use index!)
+ORDER BY ron_price ASC NULLS LAST, token_id ASC       -- Sorting
+LIMIT 50 OFFSET 0;
+```
+
+**Performance Issues:**
+1. ❌ JSONB `@>` operator with GIN index is slow for complex conditions
+2. ❌ Type casting `(attributes->'level'->>0)::int` can't use index efficiently
+3. ❌ Multiple JSONB checks (one per criteria) compounds the slowness
+4. ❌ Sorting requires scanning filtered results
+5. ❌ Deep pagination (large OFFSET) is very slow
+
+**Performance:** 800-2000ms for complex queries with multiple filters
+
+**Target ES Query (Fast!):**
+```json
+{
+  "query": {
+    "bool": {
+      "must": [
+        {"term": {"token_address": "0xa038..."}},
+        {"term": {"is_shown": true}},
+        {"term": {"order_status": "Open"}},
+        {"terms": {"properties.Accessory": ["Snot Bubble", "Omamori"]}},
+        {"terms": {"properties.Tribe": ["Bageni"]}},
+        {"range": {"properties.level": {"gte": 5}}}
+      ]
+    }
+  },
+  "sort": [
+    {"ron_price": {"order": "asc", "missing": "_last"}},
+    {"token_id": {"order": "asc"}}
   ],
-  "properties": { /* traits */ }
+  "from": 0,
+  "size": 50
 }
 ```
 
-**Decision:** Use Option 1 (Per Owner) for consistency with ERC721 and simpler queries.
+**Expected Performance:** 10-50ms (20-40x faster)
 
-### Migration Implications
-- **ERC721:** Migrate one document per token_id
-- **ERC1155:** Migrate one document per (token_id, owner) pair
-- **Index naming:** Separate indexes or same index with `token_type` field?
-  - **Recommendation:** Same index with `token_type` field for unified search
-  - Alternative: Separate indexes if collections are completely different
+**Why ES is Faster:**
+1. ✅ Native support for exact-match filters on keyword fields
+2. ✅ Native numeric range queries with proper indexes
+3. ✅ All filters evaluated in single pass
+4. ✅ Efficient sorting using doc values
+5. ✅ Better pagination performance
 
 ---
 
@@ -357,6 +802,39 @@ The indexer-metadata service (`flatten_raw_attrs` function) handles both formats
    - Only includes attributes with valid `VALID_DISPLAY_TYPE`: ["date", "string", "number", "number_ranking", "bool"]
    - Groups duplicate `trait_type` values into arrays (e.g., multiple "Accessory" values)
    - Stores trait value types in `trait_value_type` table
+
+**IMPORTANT: Display Type → ES Type Mapping:**
+From `metadata_count.rs`, these `display_type` values are treated as **numeric** in the system:
+- `"date"` → ES type: **`double`** (numeric timestamp or date value)
+- `"number"` → ES type: **`double`** (numeric value)
+- `"number_ranking"` → ES type: **`double`** (numeric ranking/score)
+- `"string"` → ES type: `keyword` (text value)
+- `"bool"` → ES type: `boolean` (true/false)
+
+**Why `double` for all numeric types:**
+- **Massive range:** ±1.7 × 10^308 (more than sufficient for any NFT trait)
+- Handles both integers (5) and decimals (12.5) without data loss
+- Simpler than choosing between `long` and `double`
+- ES stores efficiently (no significant overhead for whole numbers)
+- Range queries work identically: `level >= 5` works for both int and float
+- Values exceeding `double` range → Ignored (acceptable edge case, extremely unlikely)
+
+**Code reference (lines 26-44 in metadata_count.rs):**
+```rust
+if attribute.1.display_type.eq("number_ranking")
+    || attribute.1.display_type.eq("number")
+    || attribute.1.display_type.eq("date")
+{
+    // These are all treated as numbers - parse as f64
+    let value = &attribute.1.value[0].parse::<f64>().unwrap_or_default();
+    // Also track min_value and max_value
+}
+```
+
+**This means for Elasticsearch indexing:**
+- When `display_type` is "date", "number", or "number_ranking" → Index as numeric (long/double)
+- This enables range queries: `level >= 5`, `timestamp > 1234567890`
+- Values stored as strings in PostgreSQL are parsed to numbers during ES indexing
 
 2. **Processing `properties` object (if present):**
    - Parses each key-value pair
@@ -1492,5 +1970,112 @@ Migration progress saved to `.checkpoint.{csv_file_hash}.json`:
 
 ---
 
-**Status:** Architecture and strategy documented
-**Next:** Implement double-write in main application and migration job
+## Code Files That Need ES Integration
+
+### Indexer Service (Event Handlers)
+
+**1. ERC721 Transfer Handler**
+- **Path:** `mavis-marketplace-services/indexer/indexer/src/event/erc721_transfer.rs`
+- **Changes:** Add ES update after Postgres update
+- **Updates:** owner, is_shown, ownership_block_number, ownership_log_index, received_timestamp
+
+**2. Order Exchange Handlers**
+- **Path:** `mavis-marketplace-services/indexer/indexer/src/event/order_exchange.rs`
+- **Changes:** Add ES updates for 3 event types:
+  - `OrderCreated` → Set order fields
+  - `OrderMatched` → Clear order fields, set price/matcher
+  - `OrderCancelledVec` → Clear order fields
+
+**3. Metadata Handler**
+- **Path:** `mavis-marketplace-services/indexer/indexer-metadata/src/event/` (metadata update handler)
+- **Changes:** Add ES update after Postgres update
+- **Updates:** name, properties, image, cdn_image, metadata_last_updated, raw_metadata
+
+**4. ERC1155 Transfer Handler (Optional - Lower Priority)**
+- **Path:** `mavis-marketplace-services/indexer/indexer/src/event/erc1155_transfer.rs`
+- **Changes:** Add ES update for ERC1155 data table
+
+### GraphQL Service (Query Layer)
+
+**5. ERC721 Token Query**
+- **Path:** `mavis-marketplace-services/graphql/mavis-graphql-token/src/schema.rs`
+- **Function:** `erc721_tokens()` (line ~278)
+- **Changes:** 
+  - Add ES query builder
+  - Translate GraphQL filters to ES query
+  - Add fallback to Postgres if ES fails
+  - Maintain same response format
+
+**6. Order Creation (Optional - For Validation)**
+- **Path:** `mavis-marketplace-services/graphql/mavis-graphql-order/src/schema.rs`
+- **Function:** `create_order()` (line ~446)
+- **Changes:** Might need ES lookup for validation (optional)
+
+### New Files to Create
+
+**7. ES Client Module**
+- **Path:** Create new module (location TBD)
+- **Purpose:** 
+  - ES connection management
+  - Common ES operations (index, update, bulk)
+  - Error handling and retries
+  - Query builder utilities
+
+**8. ES Mapping Template**
+- **Path:** Create JSON file (location TBD)
+- **Purpose:** ES index mapping with dynamic templates
+
+**9. Migration Job**
+- **Path:** `migrate-sample-erc721-data/src/` (this repository)
+- **Purpose:**
+  - Read from Postgres erc721 table
+  - Transform to ES documents
+  - Bulk index to ES
+  - Checkpoint/resume support
+
+### Database Schema Reference
+
+**10. PostgreSQL Schema**
+- **Path:** `mavis-marketplace-services/database/tracker_database_migration.sql`
+- **Lines:** 828-861 (erc721 table), 897-923 (erc1155_data table)
+- **Purpose:** Reference for ES document structure
+
+### Configuration Files (To Be Updated)
+
+**11. Environment Variables**
+- Add ES_URL, ES_INDEX_PREFIX, ES_BATCH_SIZE, etc.
+- Location depends on service configuration structure
+
+**12. Dependency Files**
+- **Paths:** 
+  - `mavis-marketplace-services/indexer/indexer/Cargo.toml`
+  - `mavis-marketplace-services/graphql/mavis-graphql-token/Cargo.toml`
+  - `migrate-sample-erc721-data/Cargo.toml`
+- **Changes:** Add `elasticsearch` crate dependency
+
+---
+
+## Summary of Changes Needed
+
+### High Priority (Core Functionality)
+1. ✅ Create ES mapping template
+2. ✅ Create ES client module (shared)
+3. ✅ Update `erc721_transfer.rs` (owner changes)
+4. ✅ Update `order_exchange.rs` (order lifecycle)
+5. ✅ Update metadata handler (metadata updates)
+6. ✅ Update `erc721_tokens()` query (ES queries)
+7. ✅ Create migration job (historical data)
+
+### Medium Priority (Nice to Have)
+8. ⚠️ Add monitoring/metrics
+9. ⚠️ Add error handling/retries
+10. ⚠️ Add integration tests
+
+### Low Priority (Future)
+11. 📋 ERC1155 support
+12. 📋 Advanced ES features (aggregations, highlighting)
+
+---
+
+**Status:** Architecture and strategy documented, code paths identified
+**Next:** Begin implementation with ES client module and mapping template
